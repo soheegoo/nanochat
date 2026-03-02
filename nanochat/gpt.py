@@ -161,9 +161,11 @@ class CausalSelfAttention(nn.Module):
             attn1 = torch.cat([attn11, attn12], dim=-1)
             attn2 = torch.cat([attn21, attn22], dim=-1)
 
-            # Compute lambda (float32 for numerical stability)
-            lambda_1 = torch.exp(torch.dot(self.lambda_q1.float(), self.lambda_k1.float()))
-            lambda_2 = torch.exp(torch.dot(self.lambda_q2.float(), self.lambda_k2.float()))
+            # Compute lambda (float32 for numerical stability, clamped to prevent exp overflow)
+            dot1 = torch.dot(self.lambda_q1.float(), self.lambda_k1.float()).clamp(-10, 10)
+            dot2 = torch.dot(self.lambda_q2.float(), self.lambda_k2.float()).clamp(-10, 10)
+            lambda_1 = torch.exp(dot1)
+            lambda_2 = torch.exp(dot2)
             lambda_val = (lambda_1 - lambda_2 + self.lambda_init).to(attn1.dtype)
 
             # Differential subtraction: (B, T, num_diff_heads, 2*head_dim)
@@ -489,8 +491,10 @@ class GPT(nn.Module):
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
         # Diff attn 1D params (lambda vectors, per-head norm weight) with AdamW
+        # Lambda vectors go through exp(dot(q,k)) so they're exponentially sensitive —
+        # need a much lower LR than other scalars to prevent divergence
         if diff_attn_params:
-            param_groups.append(dict(kind='adamw', params=diff_attn_params, lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0))
+            param_groups.append(dict(kind='adamw', params=diff_attn_params, lr=scalar_lr * 0.02, betas=adam_betas, eps=1e-10, weight_decay=0.0))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)
