@@ -12,6 +12,7 @@ Notable features:
 - Flash Attention 3 integration
 """
 
+import math
 from functools import partial
 from dataclasses import dataclass
 
@@ -37,6 +38,8 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    peri_ln: bool = False  # Peri-LN: add output normalization after each sublayer (Kim et al., ICML 2025)
+    diff_attn: bool = False  # Differential Attention: noise-cancelling via softmax difference (Ye et al., ICLR 2025)
 
 
 def norm(x):
@@ -71,21 +74,42 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # Differential attention (Ye et al., ICLR 2025): attention = softmax(Q1K1) - λ·softmax(Q2K2)
+        self.diff_attn = config.diff_attn
+        if self.diff_attn:
+            assert self.n_head % 2 == 0, "n_head must be even for differential attention"
+            assert self.n_kv_head % 2 == 0, "n_kv_head must be even for differential attention"
+            self.num_diff_heads = self.n_head // 2
+            self.num_kv_diff_heads = self.n_kv_head // 2
+            self.n_v_heads = self.num_kv_diff_heads  # V has half the heads but 2x the head_dim
+            self.v_head_dim = 2 * self.head_dim
+            # Lambda reparameterization vectors (shared across heads, per layer)
+            self.lambda_q1 = nn.Parameter(torch.empty(self.head_dim))
+            self.lambda_k1 = nn.Parameter(torch.empty(self.head_dim))
+            self.lambda_q2 = nn.Parameter(torch.empty(self.head_dim))
+            self.lambda_k2 = nn.Parameter(torch.empty(self.head_dim))
+            # Per-head RMSNorm with learnable affine weight
+            self.diff_norm_weight = nn.Parameter(torch.empty(2 * self.head_dim))
+            # Lambda init constant (not learnable, depends on layer depth)
+            self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * layer_idx)
+        else:
+            self.n_v_heads = self.n_kv_head
+            self.v_head_dim = self.head_dim
+        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_v_heads, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
-        # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        # Project Q and K (same reshape for both standard and differential attention)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        # Project V (standard: n_kv_head × head_dim, diff_attn: n_kv_head/2 × 2*head_dim)
+        v = self.c_v(x).view(B, T, self.n_v_heads, self.v_head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
+            ve = ve.view(B, T, self.n_v_heads, self.v_head_dim)
+            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_v_heads), range (0, 2)
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
@@ -93,24 +117,63 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
 
-        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
-        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
-        if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if self.diff_attn:
+            # Differential attention: split Q,K into sub-head pairs, two flash attn calls
+            q = q.reshape(B, T, self.num_diff_heads, 2, self.head_dim)
+            q1, q2 = q[:, :, :, 0, :].contiguous(), q[:, :, :, 1, :].contiguous()
+            k = k.reshape(B, T, self.num_kv_diff_heads, 2, self.head_dim)
+            k1, k2 = k[:, :, :, 0, :].contiguous(), k[:, :, :, 1, :].contiguous()
+
+            if kv_cache is None:
+                # Training: FlashDiffAttn_1 variant (Q/K dim=head_dim, V dim=2*head_dim)
+                attn1 = flash_attn.flash_attn_func(q1, k1, v, causal=True, window_size=window_size)
+                attn2 = flash_attn.flash_attn_func(q2, k2, v, causal=True, window_size=window_size)
+            else:
+                # Inference: use split KV caches for the two sub-attention maps
+                k1_cache, k2_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                attn1 = flash_attn.flash_attn_with_kvcache(
+                    q1, k1_cache, v_cache, k=k1, v=v,
+                    cache_seqlens=kv_cache.cache_seqlens, causal=True, window_size=window_size,
+                )
+                attn2 = flash_attn.flash_attn_with_kvcache(
+                    q2, k2_cache, v_cache, k=k2, v=v,
+                    cache_seqlens=kv_cache.cache_seqlens, causal=True, window_size=window_size,
+                )
+                # Advance position after last layer processes
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
+
+            # Compute lambda (float32 for numerical stability)
+            lambda_1 = torch.exp(torch.dot(self.lambda_q1.float(), self.lambda_k1.float()))
+            lambda_2 = torch.exp(torch.dot(self.lambda_q2.float(), self.lambda_k2.float()))
+            lambda_val = (lambda_1 - lambda_2 + self.lambda_init).to(attn1.dtype)
+
+            # Differential subtraction: (B, T, num_diff_heads, 2*head_dim)
+            y = attn1 - lambda_val * attn2
+
+            # Per-head RMSNorm with learnable weight, scaled by (1 - lambda_init) for gradient flow
+            y = F.rms_norm(y, (2 * self.head_dim,)) * self.diff_norm_weight
+            y = y * (1 - self.lambda_init)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-            y = flash_attn.flash_attn_with_kvcache(
-                q, k_cache, v_cache,
-                k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
-                causal=True,
-                window_size=window_size,
-            )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
+            # Standard attention
+            # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
+            # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+            if kv_cache is None:
+                # Training: causal attention with optional sliding window
+                y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            else:
+                # Inference: use flash_attn_with_kvcache which handles cache management
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                y = flash_attn.flash_attn_with_kvcache(
+                    q, k_cache, v_cache,
+                    k=k, v=v,
+                    cache_seqlens=kv_cache.cache_seqlens,
+                    causal=True,
+                    window_size=window_size,
+                )
+                # Advance position after last layer processes
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
@@ -136,10 +199,16 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.peri_ln = config.peri_ln
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        if self.peri_ln:
+            # Peri-LN: norm both before and after each sublayer (Kim et al., ICML 2025)
+            x = x + norm(self.attn(norm(x), ve, cos_sin, window_size, kv_cache))
+            x = x + norm(self.mlp(norm(x)))
+        else:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+            x = x + self.mlp(norm(x))
         return x
 
 
@@ -229,6 +298,18 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
+        # Differential attention parameters (lambda vectors + per-head norm weight)
+        if self.config.diff_attn:
+            for block in self.transformer.h:
+                attn = block.attn
+                # Lambda vectors: normal(0, 0.1) so lambda starts near lambda_init
+                torch.nn.init.normal_(attn.lambda_q1, mean=0.0, std=0.1)
+                torch.nn.init.normal_(attn.lambda_k1, mean=0.0, std=0.1)
+                torch.nn.init.normal_(attn.lambda_q2, mean=0.0, std=0.1)
+                torch.nn.init.normal_(attn.lambda_k2, mean=0.0, std=0.1)
+                # Per-head RMSNorm weight: ones (neutral at init)
+                attn.diff_norm_weight.fill_(1.0)
+
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -302,17 +383,24 @@ class GPT(nn.Module):
         - Chinchilla counts exp/sum/divide in attention softmax as flops (a little sus and very tiny => we ignore)
         """
         nparams = sum(p.numel() for p in self.parameters())
-        # Exclude non-matmul params: embeddings and per-layer scalars
+        # Exclude non-matmul params: embeddings, per-layer scalars, and 1D diff_attn params
         value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
+        diff_attn_1d_numel = sum(p.numel() for p in self.transformer.h.parameters() if p.dim() == 1)
         nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+                          self.resid_lambdas.numel() + self.x0_lambdas.numel() +
+                          diff_attn_1d_numel)
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        # Sum attention FLOPs per layer, accounting for sliding window
+        # Sum attention FLOPs per layer, accounting for sliding window.
+        # Standard attention: 12 * h * q * seq  (QK^T forward+backward: 6, AV forward+backward: 6)
+        # Diff attention: 2 QK^T calls (same h*q cost each) + 2 AV calls with 2*head_dim V
+        #   = 2 * 6*h*q*seq (QK^T) + 2 * 6*h*(2q)*seq (AV) = 12*h*q*seq + 24*h*q*seq = 36*h*q*seq
+        #   But diff_attn halves the number of heads (h -> h/2), so: 36*(h/2)*q*seq = 18*h*q*seq
+        attn_multiplier = 18 if self.config.diff_attn else 12
         attn_flops = 0
         for window_size in self.window_sizes:
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
+            attn_flops += attn_multiplier * h * q * effective_seq
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
         return num_flops_per_token
 
@@ -350,13 +438,16 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Diff attn adds 1D params (lambda vectors, norm weight) that need AdamW, not Muon
+        all_block_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_block_params if p.dim() >= 2]
+        diff_attn_params = [p for p in all_block_params if p.dim() == 1]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(diff_attn_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -378,6 +469,9 @@ class GPT(nn.Module):
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
             ))
+        # Diff attn 1D params (lambda vectors, per-head norm weight) with AdamW
+        if diff_attn_params:
+            param_groups.append(dict(kind='adamw', params=diff_attn_params, lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)
