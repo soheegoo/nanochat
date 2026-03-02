@@ -81,8 +81,9 @@ class CausalSelfAttention(nn.Module):
             assert self.n_kv_head % 2 == 0, "n_kv_head must be even for differential attention"
             self.num_diff_heads = self.n_head // 2
             self.num_kv_diff_heads = self.n_kv_head // 2
-            self.n_v_heads = self.num_kv_diff_heads  # V has half the heads but 2x the head_dim
-            self.v_head_dim = 2 * self.head_dim
+            # V keeps standard shape; split into halves happens in forward (Variant 2)
+            self.n_v_heads = self.n_kv_head
+            self.v_head_dim = self.head_dim
             # Lambda reparameterization vectors (shared across heads, per layer)
             self.lambda_q1 = nn.Parameter(torch.empty(self.head_dim))
             self.lambda_k1 = nn.Parameter(torch.empty(self.head_dim))
@@ -103,7 +104,7 @@ class CausalSelfAttention(nn.Module):
         # Project Q and K (same reshape for both standard and differential attention)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        # Project V (standard: n_kv_head × head_dim, diff_attn: n_kv_head/2 × 2*head_dim)
+        # Project V (always n_kv_head × head_dim; diff_attn splits in forward)
         v = self.c_v(x).view(B, T, self.n_v_heads, self.v_head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
@@ -118,30 +119,47 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k) # QK norm
 
         if self.diff_attn:
-            # Differential attention: split Q,K into sub-head pairs, two flash attn calls
+            # Differential attention (Variant 2): split Q, K, V into sub-head pairs
+            # All tensors keep the same head_dim for FA3 compatibility
             q = q.reshape(B, T, self.num_diff_heads, 2, self.head_dim)
             q1, q2 = q[:, :, :, 0, :].contiguous(), q[:, :, :, 1, :].contiguous()
             k = k.reshape(B, T, self.num_kv_diff_heads, 2, self.head_dim)
             k1, k2 = k[:, :, :, 0, :].contiguous(), k[:, :, :, 1, :].contiguous()
+            v = v.reshape(B, T, self.num_kv_diff_heads, 2, self.head_dim)
+            v1, v2 = v[:, :, :, 0, :].contiguous(), v[:, :, :, 1, :].contiguous()
 
             if kv_cache is None:
-                # Training: FlashDiffAttn_1 variant (Q/K dim=head_dim, V dim=2*head_dim)
-                attn1 = flash_attn.flash_attn_func(q1, k1, v, causal=True, window_size=window_size)
-                attn2 = flash_attn.flash_attn_func(q2, k2, v, causal=True, window_size=window_size)
+                # Training: 4 flash_attn calls (mathematically identical to Variant 1)
+                attn11 = flash_attn.flash_attn_func(q1, k1, v1, causal=True, window_size=window_size)
+                attn12 = flash_attn.flash_attn_func(q1, k1, v2, causal=True, window_size=window_size)
+                attn21 = flash_attn.flash_attn_func(q2, k2, v1, causal=True, window_size=window_size)
+                attn22 = flash_attn.flash_attn_func(q2, k2, v2, causal=True, window_size=window_size)
             else:
-                # Inference: use split KV caches for the two sub-attention maps
-                k1_cache, k2_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
-                attn1 = flash_attn.flash_attn_with_kvcache(
-                    q1, k1_cache, v_cache, k=k1, v=v,
+                # Inference: 4 flash_attn_with_kvcache calls (k insertions are idempotent)
+                k1_cache, k2_cache, v1_cache, v2_cache = kv_cache.get_layer_cache(self.layer_idx)
+                attn11 = flash_attn.flash_attn_with_kvcache(
+                    q1, k1_cache, v1_cache, k=k1, v=v1,
                     cache_seqlens=kv_cache.cache_seqlens, causal=True, window_size=window_size,
                 )
-                attn2 = flash_attn.flash_attn_with_kvcache(
-                    q2, k2_cache, v_cache, k=k2, v=v,
+                attn12 = flash_attn.flash_attn_with_kvcache(
+                    q1, k1_cache, v2_cache, k=k1, v=v2,
+                    cache_seqlens=kv_cache.cache_seqlens, causal=True, window_size=window_size,
+                )
+                attn21 = flash_attn.flash_attn_with_kvcache(
+                    q2, k2_cache, v1_cache, k=k2, v=v1,
+                    cache_seqlens=kv_cache.cache_seqlens, causal=True, window_size=window_size,
+                )
+                attn22 = flash_attn.flash_attn_with_kvcache(
+                    q2, k2_cache, v2_cache, k=k2, v=v2,
                     cache_seqlens=kv_cache.cache_seqlens, causal=True, window_size=window_size,
                 )
                 # Advance position after last layer processes
                 if self.layer_idx == kv_cache.n_layers - 1:
                     kv_cache.advance(T)
+
+            # Recombine V halves: (B, T, num_diff_heads, 2*head_dim)
+            attn1 = torch.cat([attn11, attn12], dim=-1)
+            attn2 = torch.cat([attn21, attn22], dim=-1)
 
             # Compute lambda (float32 for numerical stability)
             lambda_1 = torch.exp(torch.dot(self.lambda_q1.float(), self.lambda_k1.float()))
@@ -392,10 +410,11 @@ class GPT(nn.Module):
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window.
         # Standard attention: 12 * h * q * seq  (QK^T forward+backward: 6, AV forward+backward: 6)
-        # Diff attention: 2 QK^T calls (same h*q cost each) + 2 AV calls with 2*head_dim V
-        #   = 2 * 6*h*q*seq (QK^T) + 2 * 6*h*(2q)*seq (AV) = 12*h*q*seq + 24*h*q*seq = 36*h*q*seq
-        #   But diff_attn halves the number of heads (h -> h/2), so: 36*(h/2)*q*seq = 18*h*q*seq
-        attn_multiplier = 18 if self.config.diff_attn else 12
+        # Diff attention (Variant 2): 4 flash calls, each with h/2 heads and head_dim q
+        #   = 4 * (6*(h/2)*q + 6*(h/2)*q) * seq = 4 * 12*(h/2)*q*seq = 24*h*q*seq
+        #   But h/2 heads means: 4 * 12 * (h/2) = 24h/2 = ... simplified: 24*(h/2)*q = 12*h*q per call pair
+        #   Total: 4 calls × 6*(h/2)*q*seq each for QK^T + AV = 4*12*(h/2)*q*seq = 24*h*q*seq
+        attn_multiplier = 24 if self.config.diff_attn else 12
         attn_flops = 0
         for window_size in self.window_sizes:
             window = window_size[0]  # (left, right) tuple, we use left

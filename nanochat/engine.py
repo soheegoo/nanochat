@@ -89,8 +89,8 @@ class KVCache:
     - FA3 updates the cache in-place during flash_attn_with_kvcache
     - Position tracked per batch element via cache_seqlens tensor
 
-    Supports differential attention (diff_attn=True): stores separate K1, K2 caches
-    and V with 2x head_dim (half the heads, double the dimension).
+    Supports differential attention (diff_attn=True): stores separate K1, K2, V1, V2
+    caches (Variant 2: all tensors same head_dim for FA3 compatibility).
     """
 
     def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype, diff_attn=False):
@@ -104,11 +104,11 @@ class KVCache:
         if diff_attn:
             assert num_heads % 2 == 0, "num_heads must be even for differential attention KV cache"
             num_kv_diff_heads = num_heads // 2
-            # Separate K1 and K2 caches for the two sub-attention maps
+            # Separate K1, K2, V1, V2 caches (Variant 2: all same head_dim)
             self.k1_cache = torch.zeros(num_layers, batch_size, seq_len, num_kv_diff_heads, head_dim, device=device, dtype=dtype)
             self.k2_cache = torch.zeros(num_layers, batch_size, seq_len, num_kv_diff_heads, head_dim, device=device, dtype=dtype)
-            # V cache: half the heads, 2x the head_dim
-            self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_kv_diff_heads, 2 * head_dim, device=device, dtype=dtype)
+            self.v1_cache = torch.zeros(num_layers, batch_size, seq_len, num_kv_diff_heads, head_dim, device=device, dtype=dtype)
+            self.v2_cache = torch.zeros(num_layers, batch_size, seq_len, num_kv_diff_heads, head_dim, device=device, dtype=dtype)
         else:
             self.k_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
             self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
@@ -124,9 +124,9 @@ class KVCache:
         return self.cache_seqlens[0].item()
 
     def get_layer_cache(self, layer_idx):
-        """Return cache views for a specific layer. Returns (k1, k2, v) for diff_attn, else (k, v)."""
+        """Return cache views for a specific layer. Returns (k1, k2, v1, v2) for diff_attn, else (k, v)."""
         if self.diff_attn:
-            return self.k1_cache[layer_idx], self.k2_cache[layer_idx], self.v_cache[layer_idx]
+            return self.k1_cache[layer_idx], self.k2_cache[layer_idx], self.v1_cache[layer_idx], self.v2_cache[layer_idx]
         return self.k_cache[layer_idx], self.v_cache[layer_idx]
 
     def advance(self, num_tokens):
@@ -146,9 +146,11 @@ class KVCache:
         if self.diff_attn:
             self.k1_cache[:, :, :other_pos, :, :] = other.k1_cache[:, :, :other_pos, :, :]
             self.k2_cache[:, :, :other_pos, :, :] = other.k2_cache[:, :, :other_pos, :, :]
+            self.v1_cache[:, :, :other_pos, :, :] = other.v1_cache[:, :, :other_pos, :, :]
+            self.v2_cache[:, :, :other_pos, :, :] = other.v2_cache[:, :, :other_pos, :, :]
         else:
             self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
-        self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
+            self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
         self.cache_seqlens.fill_(other_pos)
 
 # -----------------------------------------------------------------------------
