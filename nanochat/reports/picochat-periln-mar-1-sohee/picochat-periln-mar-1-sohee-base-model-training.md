@@ -1,0 +1,53 @@
+## Base model training
+timestamp: 2026-03-01 19:28:14
+
+- run: picochat-periln-mar-1-sohee
+- device_type: 
+- fp8: False
+- fp8_recipe: tensorwise
+- depth: 12
+- aspect_ratio: 64
+- head_dim: 128
+- max_seq_len: 2048
+- window_pattern: SSSL
+- peri_ln: True
+- num_iterations: -1
+- target_flops: -1.0000
+- target_param_data_ratio: 10.5000
+- device_batch_size: 64
+- total_batch_size: -1
+- embedding_lr: 0.3000
+- unembedding_lr: 0.0040
+- weight_decay: 0.2000
+- matrix_lr: 0.0200
+- scalar_lr: 0.5000
+- adam_beta1: 0.8000
+- adam_beta2: 0.9500
+- warmup_ratio: 0.0000
+- warmdown_ratio: 0.5000
+- final_lr_frac: 0.0000
+- resume_from_step: -1
+- eval_every: 250
+- eval_tokens: 20,971,520
+- core_metric_every: 2000
+- core_metric_max_per_task: 500
+- sample_every: 2000
+- save_every: 1000
+- model_tag: picochat-periln-mar-1-sohee
+- Number of parameters: 286,262,424
+- Number of FLOPs per token: 8.021676e+08
+- Calculated number of iterations: 2205
+- Number of training tokens: 1,156,055,040
+- Tokens : Scaling params ratio: 10.4999
+- DDP world size: 4
+- warmup_ratio: 0.0000
+- warmdown_ratio: 0.5000
+- final_lr_frac: 0.0000
+- Minimum validation bpb: 0.9098
+- Final validation bpb: 0.9098
+- CORE metric estimate: 0.1111
+- MFU %: 42.83%
+- Total training flops: 9.273498e+17
+- Total training time: 9.14m
+- Peak memory usage: 60494.51MiB
+
