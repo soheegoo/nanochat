@@ -1,0 +1,65 @@
+## Base model evaluation
+timestamp: 2026-03-04 22:10:11
+
+- model: base_model (step 1000)
+- CORE metric: 0.0904
+- train bpb: 0.9811
+- val bpb: 0.9831
+- hellaswag_zeroshot: 0.0675
+- jeopardy: 0.0014
+- bigbench_qa_wikidata: 0.2360
+- arc_easy: 0.2823
+- arc_challenge: -0.0148
+- copa: 0.0600
+- commonsense_qa: 0.0715
+- piqa: 0.2144
+- openbook_qa: 0.0320
+- lambada_openai: 0.2422
+- hellaswag: 0.0642
+- winograd: 0.1355
+- winogrande: 0.0434
+- bigbench_dyck_languages: 0.0980
+- agi_eval_lsat_ar: 0.0489
+- bigbench_cs_algorithms: 0.4114
+- bigbench_operators: 0.0524
+- bigbench_repeat_copy_logic: 0.0000
+- squad: 0.0310
+- coqa: 0.0476
+- boolq: -0.3174
+- bigbench_language_identification: 0.1818
+- sample 0: <|bos|>The capital of France is the city of Paris. It is the capital of the French Republic and the capital
+- sample 1: <|bos|>The chemical symbol of gold is the gold standard. It is a symbol of the gold standard. It is a
+- sample 2: <|bos|>If yesterday was Friday, then tomorrow will be Friday, the 12th day of the 12th month of the Greg
+- sample 3: <|bos|>The opposite of hot is the opposite of cold. The opposite of hot is the opposite of cold. The
+- sample 4: <|bos|>The planets of the solar system are: Jupiter, Saturn, Uranus, Neptune, Uranus, Neptune, Pluto,
+- sample 5: <|bos|>My favorite color is blue. I love the color of my favorite color. I love the color of
+- sample 6: <|bos|>If 5*x + 3 = 13, then x is 5*x + 3 = 13, then x is 5
+- unconditioned 0: <|bos|>The Summary can be found here (Advanced, our Future):
+If the conditions were good for the miracle of the Polyomplex Virus then, as we learned elsewhere, we would be glad to find out otherwise – not chilled or beaten up;.
+Younger, older, still, middle-aged and then we really enjoyed that Polyomplex Virus, which has a mind-blowing and sometimes surprising origin in the body, is known to be one of the most dangerous infectious disease.
+It was originally a fatal disease that was spread through infected or exposed human blood by injection in the 1950’s and most likely was spread during vaccination in the
+- unconditioned 1: <|bos|>New York Times, April 11, 2019
+Parents at The Art Institute Were Octavoipping Followbreak Mobile Skip to Main Page
+Collection is a surosite of a little different from plowing the lawn. Its distinguishing features are still visible; they are designed to conserve water, sense if the wind is off, and block the prevailing wind, which sometimes causes the grafting trip into the interior of the lawn. Special roaming engineers at The Art Institute were dedicated in the wake of an absorption of crystalline lens like dust by focusing the blades of auxiliary crafts made at the lower ends of the shaft.
+Built
+- unconditioned 2: <|bos|>Learn how to develop formulas suitable for digital video recording studio overlap in the camera system or alternative video recording studio certification exams test.
+The AORM certification exam was administered by PBSAK and a standardized the certification specification is developed for recording creator. The exam score for AORM These scores were provided by PECSA, the leading Certificate Authority for the United States Department of Commerce. These scores were used to design and prepare the AORM software and render the Eduard software, which is the operating system built in software engineering software, which assists in getting Eduard out of fuzzy setups with editing and animation.
+“At
+- unconditioned 3: <|bos|>Civil war 100,000 men killed at the hands of the British and caesar his own assistant Murphy. May 17, 1865.
+Murray, W. J. Consens
+Wright, S. D. Long
+MSN: 399 LeBirth, SC: 196-188.37 19644
+Atomic Number: 449·43·93·12·13·10773
+Conducted by: James G. Foetzlgal
+Single Civil War Medals: Millionaires Mass.
+War Battle: Creation 
+- unconditioned 4: <|bos|>Dialysis is becoming increasingly popular as a healthcare aid because it causes the kidneys and urinary tract to filter more than waste products. The kidneys are great at filtering our waste products, but they may be producing too little and not filtered optimally. Particles may be discharged and released when drinking an aquarium containing cake and parakeets, and sometimes when ingots are discarded and pollarded or lost as quickly as it's filtered drinking water (moist's urine).
+While we originally focused on helping your kidneys filter our impurities and wash our waters (especially if you have had any juvenile diabetes), in reality, they will function as filters that remove
+- unconditioned 5: <|bos|>Freedom About the EU consists of the Council of Europe and its Member States. The European Council has an EU District Language Commission structure which addresses the political situation of EU member states and the legal figures that hold the European Union together. The Council establishes pre-internship rules for meeting foreign powers. Subsequently, the Council of Europe consists of the European Union's Council of European Union which occupies an administrative headquartered half of the EU.
+The European EU Council comprises 30 European Union members who are European members when they enter into Confederation namely Estonia, Latvia, Lithuania, Germany, Poland and Spain. The current EU Member States of EU
+- unconditioned 6: <|bos|>Augustflies are one of the most widely diverse insects. While most insects are native to warm tropical locale populations across the continent and inhabit freshwater environments of forests and wetlands, most colonial and post colonial entomologies are native to temperate or tropical areas. In contrast, speciation in seaweeds is limited, and many species occur most often in tropical or temperate zones. As a result, not all tropical insects are native to the temperate regions of the tropics. For example, Florida pantaloons are restricted to temperate and tropical latitudes and the Florida pantaloon is restricted to latitudes north of the Coral Sea.
+Public Entrance International has an online
+- unconditioned 7: <|bos|>The Genetics of retinal vein disease
+There has been a gradual evolution of knowledge of the possible genetic cause of the development of radiculopathy. In a healthy vein, the numerous internal structures of the superficial layer in a vascular is well coordinated by the penetrating external layer of the vascular. The carotid artery and that originates from the carotid artery circulates from the carotid artery to the vertebral membrane, other internal structures are integrated into the vascular. At this layer, the layer of the vascular is attached by capillaries and dispersed by capillaries.
+The vascular develops gradually during the vascular’s descent into the surrounding world. When the migration from deeper to the
+
