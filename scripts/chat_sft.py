@@ -33,6 +33,9 @@ from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
 from tasks.spellingbee import SimpleSpelling, SpellingBee
+from tasks.dolly import Dolly
+from tasks.orcamath import OrcaMath
+from tasks.numinamath import NuminaMath
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -167,6 +170,9 @@ train_tasks = [
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
     SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    Dolly(split="train"), # 15K rows of instruction-following (e.g. write a haiku about the ocean)
+    OrcaMath(stop=15000, split="train"), # 15K rows of math word problems with step-by-step solutions
+    NuminaMath(stop=15000, split="train"), # 15K rows of math word problems with step-by-step solutions
 ]
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
