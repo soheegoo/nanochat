@@ -107,11 +107,137 @@ class GSM8K(Task):
         is_correct = int(pred_num == ref_num)
         return is_correct
 
+# NOTE modify this for A4, or another dataset reward. Update the reward . s
     def reward(self, conversation, assistant_response):
         """
         Used during RL. To keep things simple, just re-use the evaluation above.
         Later this could be made more complex (e.g. format matching etc.)
         """
+        # BASELINE REWARD
         is_correct = self.evaluate(conversation, assistant_response)
         is_correct_float = float(is_correct)
         return is_correct_float
+
+        # BASELINE + FORMAT
+        # reward = 0.0
+
+        # # Correctness: 1.0
+        # is_correct = self.evaluate(conversation, assistant_response)
+        # reward += float(is_correct)
+
+        # # Format: 0.25 for having #### on the last line AND 2-8 newlines total
+        # lines = assistant_response.rstrip().split('\n')
+        # last_line = lines[-1].strip() if lines else ""
+        # has_marker = last_line.startswith("####")
+        # newline_count = assistant_response.count('\n')
+        # good_length = 2 <= newline_count <= 8
+
+        # if has_marker and good_length:
+        #     reward += 0.25
+
+        # return min(reward, 1.0)
+
+
+        ####################################################################################
+
+        # BASELINE + REFERENCE NUMBERS
+        # reward = 0.0
+        # is_correct = self.evaluate(conversation, assistant_response)
+        # reward += float(is_correct)
+        # # Extract all numbers from the user prompt
+        # user_message = conversation['messages'][0]['content']
+        # prompt_numbers = set(re.findall(r'\d+\.?\d*', user_message))
+        # # Check if at least 80% of prompt numbers appear in the response
+        # if prompt_numbers:
+        #     matched = sum(1 for n in prompt_numbers if n in assistant_response)
+        #     if matched / len(prompt_numbers) >= 0.8:
+        #         reward += 0.25
+        # return min(reward, 1.0)
+
+        ####################################################################################
+
+def _count_steps(answer_text):
+    """Count the number of calculator steps (<<...>>) in a GSM8K answer."""
+    return len(re.findall(r'<<[^>]+>>', answer_text))
+
+
+class GSM8KFiltered(GSM8K):
+    """GSM8K filtered by number of reasoning steps (calculator calls)."""
+
+    def __init__(self, subset, split, min_steps=0, max_steps=float('inf'), **kwargs):
+        # Don't pass kwargs to GSM8K yet — we need to filter first
+        super().__init__(subset, split, **kwargs)
+        # Filter indices by step count
+        self.filtered_indices = []
+        for i in range(len(self.ds)):
+            num_steps = _count_steps(self.ds[i]['answer'])
+            if min_steps <= num_steps <= max_steps:
+                self.filtered_indices.append(i)
+        print(f"GSM8KFiltered: {len(self.filtered_indices)}/{len(self.ds)} examples "
+              f"with {min_steps} <= steps <= {max_steps}")
+
+    def num_examples(self):
+        return len(self.filtered_indices)
+
+    def get_example(self, index):
+        real_index = self.filtered_indices[index]
+        row = self.ds[real_index]
+        return self._build_conversation(row)
+
+    def _build_conversation(self, row):
+        """Shared logic to build a conversation from a dataset row."""
+        question = row['question']
+        answer = row['answer']
+        assistant_message_parts = []
+        parts = re.split(r'(<<[^>]+>>)', answer)
+        for part in parts:
+            if part.startswith('<<') and part.endswith('>>'):
+                inner = part[2:-2]
+                if '=' in inner:
+                    expr, result = inner.rsplit('=', 1)
+                else:
+                    expr, result = inner, ""
+                assistant_message_parts.append({"type": "python", "text": expr})
+                assistant_message_parts.append({"type": "python_output", "text": result})
+            else:
+                assistant_message_parts.append({"type": "text", "text": part})
+        return {
+            "messages": [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": assistant_message_parts},
+            ]
+        }
+
+
+class GSM8KEasy(GSM8KFiltered):
+    """GSM8K problems with <= 2 reasoning steps (36% of train, 2674 problems)."""
+    def __init__(self, subset, split, **kwargs):
+        super().__init__(subset, split, min_steps=0, max_steps=2, **kwargs)
+
+
+class GSM8KHard(GSM8KFiltered):
+    """GSM8K problems with > 2 reasoning steps (64% of train, 4799 problems)."""
+    def __init__(self, subset, split, **kwargs):
+        super().__init__(subset, split, min_steps=3, max_steps=float('inf'), **kwargs)
+
+
+if __name__ == "__main__":
+    from collections import Counter
+    ds = load_dataset("openai/gsm8k", "main", split="train")
+    counts = [_count_steps(row['answer']) for row in ds]
+    dist = Counter(counts)
+    total = len(counts)
+    print(f"\nGSM8K train split: {total} problems")
+    print(f"Mean steps: {sum(counts)/total:.1f}")
+    print(f"Median steps: {sorted(counts)[total//2]}")
+    print(f"\nDistribution:")
+    cumulative = 0
+    for steps in sorted(dist.keys()):
+        n = dist[steps]
+        cumulative += n
+        print(f"  {steps} steps: {n:>5} problems ({100*n/total:5.1f}%)  cumulative: {cumulative:>5} ({100*cumulative/total:5.1f}%)")
+    print(f"\nSuggested splits for even cut:")
+    for cutoff in range(1, max(dist.keys())):
+        easy = sum(n for s, n in dist.items() if s <= cutoff)
+        hard = total - easy
+        print(f"  <= {cutoff} / > {cutoff}: {easy} ({100*easy/total:.0f}%) / {hard} ({100*hard/total:.0f}%)")
