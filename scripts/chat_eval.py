@@ -9,13 +9,15 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -a ARC-Easy
 """
 
 import argparse
+import json
+import os
 from functools import partial
 from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type, get_base_dir
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -37,6 +39,7 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
     # Run the evaluation
     num_passed, total = 0, 0
+    per_problem_records = []
     for i in range(ddp_rank, num_problems, ddp_world_size):
         conversation = task_object[i]
 
@@ -61,11 +64,52 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         total += 1
         num_passed += int(passed)
 
+        # Log per-problem details
+        question = conversation['messages'][0]['content'] if conversation['messages'] else ""
+        # Extract ground truth answer if available
+        ground_truth = ""
+        if len(conversation['messages']) > 1:
+            gt_content = conversation['messages'][-1]['content']
+            if isinstance(gt_content, list):
+                ground_truth = "".join(p.get('text', '') for p in gt_content)
+            elif isinstance(gt_content, str):
+                ground_truth = gt_content
+        per_problem_records.append({
+            "index": i,
+            "question": question,
+            "ground_truth": ground_truth,
+            "completions": completions,
+            "outcomes": outcomes,
+            "passed": passed,
+        })
+
         # Logging (overwrite the same line in the console)
         print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
 
     # Finish the in-place progress line with a newline before final summary
     print()
+
+    # Gather per-problem records from all ranks
+    if ddp:
+        import pickle
+        serialized = pickle.dumps(per_problem_records)
+        local_size = torch.tensor([len(serialized)], dtype=torch.long, device=device)
+        all_sizes = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(ddp_world_size)]
+        dist.all_gather(all_sizes, local_size)
+        max_size = max(s.item() for s in all_sizes)
+        padded = serialized + b'\0' * (max_size - len(serialized))
+        local_tensor = torch.frombuffer(bytearray(padded), dtype=torch.uint8).to(device)
+        gathered = [torch.zeros(max_size, dtype=torch.uint8, device=device) for _ in range(ddp_world_size)]
+        dist.all_gather(gathered, local_tensor)
+        if ddp_rank == 0:
+            all_records = []
+            for size_tensor, data_tensor in zip(all_sizes, gathered):
+                size = size_tensor.item()
+                rank_records = pickle.loads(data_tensor[:size].cpu().numpy().tobytes())
+                all_records.extend(rank_records)
+            per_problem_records = sorted(all_records, key=lambda r: r["index"])
+    else:
+        per_problem_records.sort(key=lambda r: r["index"])
 
     # Aggregate results across all ranks
     if ddp:
@@ -79,8 +123,8 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
     print0("=" * 50)
     print0(f"Final: {num_passed}/{total} ({100*num_passed/total:.2f}%)")
 
-    # Return the accuracy
-    return num_passed/total
+    # Return the accuracy and per-problem records
+    return num_passed/total, per_problem_records
 
 # -----------------------------------------------------------------------------
 # Categorical evaluation loop
@@ -101,6 +145,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     # Run the evaluation
     letter_to_id_cache = {} # many letters will repeat often, let's save the tokenizer some work
     num_passed, total = 0, 0
+    per_problem_records = []
     for i in range(ddp_rank, num_batches, ddp_world_size):
         i0, i1 = i * batch_size, min((i + 1) * batch_size, num_problems)
 
@@ -141,6 +186,39 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
             num_passed += int(outcome)
             total += 1
 
+            # Log per-problem details
+            question = conversation['messages'][0]['content'] if conversation['messages'] else ""
+            ground_truth = conversation.get('answer_letter', '')
+            per_problem_records.append({
+                "index": i0 + idx,
+                "question": question,
+                "ground_truth": ground_truth,
+                "predicted": predicted_letter,
+                "correct": bool(outcome),
+            })
+
+    # Gather per-problem records from all ranks
+    if ddp:
+        import pickle
+        serialized = pickle.dumps(per_problem_records)
+        local_size = torch.tensor([len(serialized)], dtype=torch.long, device=device)
+        all_sizes = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(ddp_world_size)]
+        dist.all_gather(all_sizes, local_size)
+        max_size = max(s.item() for s in all_sizes)
+        padded = serialized + b'\0' * (max_size - len(serialized))
+        local_tensor = torch.frombuffer(bytearray(padded), dtype=torch.uint8).to(device)
+        gathered = [torch.zeros(max_size, dtype=torch.uint8, device=device) for _ in range(ddp_world_size)]
+        dist.all_gather(gathered, local_tensor)
+        if ddp_rank == 0:
+            all_records = []
+            for size_tensor, data_tensor in zip(all_sizes, gathered):
+                size = size_tensor.item()
+                rank_records = pickle.loads(data_tensor[:size].cpu().numpy().tobytes())
+                all_records.extend(rank_records)
+            per_problem_records = sorted(all_records, key=lambda r: r["index"])
+    else:
+        per_problem_records.sort(key=lambda r: r["index"])
+
     # Aggregate results across all ranks
     if ddp:
         num_passed_tensor = torch.tensor([num_passed], dtype=torch.long, device=device)
@@ -152,7 +230,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 
     average = num_passed/total
     print0(f"Final: {num_passed}/{total} ({100*average:.2f}%)")
-    return average
+    return average, per_problem_records
 
 # -----------------------------------------------------------------------------
 
@@ -171,12 +249,12 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     task_object = task_module()
     # Run the evaluation
     if task_object.eval_type == 'generative':
-        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
+        acc, records = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems)
     elif task_object.eval_type == 'categorical':
-        acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
+        acc, records = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
     else:
         raise ValueError(f"Unsupported task evaluation type: {task_object.eval_type}")
-    return acc
+    return acc, records
 
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -219,9 +297,10 @@ if __name__ == "__main__":
 
     # Run all the task evaluations sequentially
     results = {}
+    all_per_problem_records = {}
     for task_name in task_names:
         with autocast_ctx:
-            acc = run_chat_eval(
+            acc, records = run_chat_eval(
                 task_name,
                 model, tokenizer, engine,
                 batch_size=args.batch_size,
@@ -232,7 +311,20 @@ if __name__ == "__main__":
                 max_problems=args.max_problems,
             )
             results[task_name] = acc
+            all_per_problem_records[task_name] = records
             print0(f"{task_name} accuracy: {100 * acc:.2f}%")
+
+    # Save per-problem eval results to JSON (rank 0 only)
+    ddp_rank_main = 0 if not ddp else ddp_rank
+    if ddp_rank_main == 0:
+        eval_log_dir = os.path.join(get_base_dir(), "eval_logs")
+        os.makedirs(eval_log_dir, exist_ok=True)
+        for task_name, records in all_per_problem_records.items():
+            if records:
+                out_path = os.path.join(eval_log_dir, f"{args.source}_{task_name}_eval_results.json")
+                with open(out_path, "w") as f:
+                    json.dump(records, f, indent=2)
+                print0(f"Saved {len(records)} per-problem results to {out_path}")
 
     # Log to report
     from nanochat.report import get_report

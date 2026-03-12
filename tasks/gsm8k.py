@@ -117,6 +117,9 @@ class GSM8K(Task):
         is_correct = self.evaluate(conversation, assistant_response)
         is_correct_float = float(is_correct)
         return is_correct_float
+    
+        ####################################################################################
+
 
         # BASELINE + FORMAT
         # reward = 0.0
